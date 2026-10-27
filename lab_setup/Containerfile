@@ -1,0 +1,34 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install SSH server, rsyslog, python3 and curl
+RUN apt-get update && apt-get install -y \
+    openssh-server \
+    rsyslog \
+    python3 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Setup SSH directory
+RUN mkdir -p /var/run/sshd /var/log
+
+# Create a test victim user with a weak password
+RUN useradd -m -s /bin/bash victim && \
+    echo "victim:password123" | chpasswd && \
+    echo "root:toor" | chpasswd
+
+# Configure SSH to allow password authentication and log to auth.log
+RUN sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
+    sed -i 's/#LogLevel INFO/LogLevel VERBOSE/' /etc/ssh/sshd_config
+
+# Create a minimal HTML mock page for web testing
+RUN mkdir -p /var/www/html && \
+    echo "<h1>Cyber Lab Victim Server</h1><p>Running vulnerable demo service.</p>" > /var/www/html/index.html
+
+EXPOSE 22 80
+
+# Start rsyslog, sshd and python lightweight HTTP server
+CMD service rsyslog start && \
+    /usr/sbin/sshd && \
+    python3 -m http.server 80 --directory /var/www/html
