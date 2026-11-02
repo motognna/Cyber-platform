@@ -1,188 +1,225 @@
-"""Detection engine with heuristic rules, signature matching, and MITRE ATT&CK mapping."""
+"""Motor de detectie: reguli euristice/semnaturi + corelare intre evenimente."""
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional, Pattern, Set, Tuple
 from urllib.parse import unquote
 
+from blue_team.catalog import AttackType, Severity
 from blue_team.parser import AuthEntry, ParsedEntry, WebEntry
 
-
-class Severity(str, Enum):
-    """Alert severity levels."""
-    LOW = "LOW"
-    MEDIUM = "MEDIUM"
-    HIGH = "HIGH"
-    CRITICAL = "CRITICAL"
-
-
-class AttackType(str, Enum):
-    """Categorized attack types."""
-    SSH_INVALID_USER = "SSH User Enumeration / Guessing"
-    SSH_FAILED_LOGIN = "SSH Failed Authentication"
-    SQL_INJECTION = "SQL Injection (SQLi)"
-    PATH_TRAVERSAL = "Path / Directory Traversal"
-    RECON_SCANNER = "Automated Vulnerability Scanner"
-    SENSITIVE_PROBE = "Sensitive File / Endpoint Probing"
-    SUSPICIOUS = "Suspicious Activity"
+DEFAULT_BRUTEFORCE_THRESHOLD = 3
 
 
 @dataclass
 class DetectionAlert:
-    """Represents a suspicious or malicious hit detected on a log entry."""
+    """O potrivire de regula pe o singura linie de log."""
+
     attack_type: AttackType
     severity: Severity
-    mitre_id: str
-    mitre_tactic: str
     description: str
     matched_detail: str
     entry: ParsedEntry
 
 
-# --- Signature Patterns for Web Attacks ---
+_I = re.IGNORECASE
 
-SQLI_PATTERNS = [
-    (re.compile(r"(\bUNION\b\s+(?:ALL\s+)?\bSELECT\b)", re.IGNORECASE), "UNION SELECT construct"),
-    (re.compile(r"(?:'|\")\s*(?:OR|AND)\s+['\"0-9\w]+\s*=\s*['\"0-9\w]+", re.IGNORECASE), "Boolean-based OR/AND clause"),
-    (re.compile(r"(?:'\s*OR\s*1\s*=\s*1|'\s*OR\s*'1'\s*=\s*'1')", re.IGNORECASE), "Tautology bypass (' OR 1=1)"),
-    (re.compile(r"\binformation_schema\b", re.IGNORECASE), "Metadata table access (information_schema)"),
-    (re.compile(r"\b(SLEEP|BENCHMARK|WAITFOR\s+DELAY)\b", re.IGNORECASE), "Time-based blind SQLi payload"),
-    (re.compile(r"(?:--|\#|/\*).*", re.IGNORECASE), "SQL comment injection"),
+SQLI_RULES: List[Tuple[Pattern[str], str]] = [
+    (re.compile(r"\bunion\b(?:\s|/\*.*?\*/)+(?:all\s+)?select\b", _I), "UNION SELECT"),
+    (re.compile(r"\b(?:or|and)\s+['\"]?\w+['\"]?\s*=\s*['\"]?\w+", _I), "tautologie booleana (OR 1=1)"),
+    (re.compile(r"['\"]\s*(?:or|and)\b", _I), "ghilimele urmate de OR/AND"),
+    (re.compile(r"['\"]\s*(?:--|#|;|/\*)"), "ghilimele urmate de comentariu SQL"),
+    (re.compile(r";\s*(?:drop|insert|update|delete|exec|select)\b", _I), "interogari stivuite"),
+    (re.compile(r"\binformation_schema\b|\bsqlite_master\b", _I), "enumerare schema (information_schema)"),
+    (
+        re.compile(
+            r"\bsleep\s*\(|\bpg_sleep\b|\bbenchmark\s*\(|\bwaitfor\s+delay\b|\bload_file\s*\(|"
+            r"\binto\s+(?:out|dump)file\b|\bextractvalue\s*\(|\bupdatexml\s*\(",
+            _I,
+        ),
+        "functie SQL periculoasa (SLEEP/LOAD_FILE/...)",
+    ),
+    (re.compile(r"\bselect\b.+\bfrom\b", _I), "SELECT ... FROM in parametru"),
 ]
 
-PATH_TRAVERSAL_PATTERNS = [
-    (re.compile(r"(?:\.\./|\.\.\\|%2e%2e%2f|%2e%2e/|\.\.%2f)", re.IGNORECASE), "Relative directory traversal (../)"),
-    (re.compile(r"(?:/etc/(?:passwd|shadow|hosts|group)|c:[\\/]windows)", re.IGNORECASE), "Sensitive OS file targeting"),
+TRAVERSAL_RULES: List[Tuple[Pattern[str], str]] = [
+    (re.compile(r"\.\.[/\\]|[/\\]\.\.(?:$|[?#])"), "secventa '../'"),
+    (re.compile(r"/etc/(?:passwd|shadow|group|hosts)\b|/proc/self/", _I), "fisier de sistem Linux"),
+    (re.compile(r"\b(?:boot|win)\.ini\b|\bc:[/\\]windows", _I), "fisier de sistem Windows"),
 ]
 
-SCANNER_USER_AGENTS = [
-    (re.compile(r"\bsqlmap\b", re.IGNORECASE), "SQLMap automated SQLi tool"),
-    (re.compile(r"\bnikto\b", re.IGNORECASE), "Nikto web vulnerability scanner"),
-    (re.compile(r"\b(nmap|masscan)\b", re.IGNORECASE), "Port & network scanner"),
-    (re.compile(r"\b(dirbuster|gobuster|ffuf|wfuzz)\b", re.IGNORECASE), "Web content / directory bruteforcer"),
-    (re.compile(r"\bnuclei\b", re.IGNORECASE), "Nuclei vulnerability scanner"),
+RCE_RULES: List[Tuple[Pattern[str], str]] = [
+    (re.compile(r"\$\{\s*jndi\s*:", _I), "Log4Shell (${jndi:...})"),
+    (re.compile(r"\(\)\s*\{\s*:\s*;\s*\}"), "Shellshock (() { :;})"),
+    (
+        re.compile(
+            r"(?:;|\|\|?|&&|`|\$\()\s*(?:cat|ls|id|whoami|uname|wget|curl|nc|ncat|bash|sh|python[23]?|perl|"
+            r"php|powershell|cmd|chmod|rm)\b",
+            _I,
+        ),
+        "operator shell urmat de comanda",
+    ),
+    (re.compile(r"/bin/(?:ba)?sh\b|cmd\.exe|base64\s+-d", _I), "invocare shell/decodare payload"),
+    (re.compile(r"\b(?:system|passthru|shell_exec|eval)\s*\(", _I), "functie de executie (system/eval)"),
 ]
 
-SENSITIVE_ENDPOINTS = [
-    (re.compile(r"(?:/\.env|/\.git|/\.aws|/\.ssh|/wp-config\.php(?:\.bak)?|/phpmyadmin|/admin\.php\.bak)", re.IGNORECASE), "Sensitive configuration / environment file"),
+XSS_RULES: List[Tuple[Pattern[str], str]] = [
+    (re.compile(r"<\s*script\b", _I), "tag <script>"),
+    (re.compile(r"javascript\s*:", _I), "URI javascript:"),
+    (re.compile(r"<[^>]{0,60}\bon\w+\s*=", _I), "handler de eveniment inline (onerror=...)"),
 ]
 
+SCANNER_USER_AGENTS: List[Tuple[Pattern[str], str]] = [
+    (re.compile(r"\bsqlmap\b", _I), "sqlmap (SQL injection automat)"),
+    (re.compile(r"\bnikto\b", _I), "Nikto (scanner web)"),
+    (re.compile(r"\b(?:nmap|masscan|zgrab)\b", _I), "scanner de retea (nmap/masscan)"),
+    (re.compile(r"\b(?:dirbuster|gobuster|ffuf|wfuzz|feroxbuster)\b", _I), "brute-force de directoare"),
+    (re.compile(r"\b(?:nuclei|acunetix|nessus|openvas|wpscan|whatweb)\b", _I), "scanner de vulnerabilitati"),
+    (re.compile(r"\bhydra\b", _I), "THC-Hydra (brute force)"),
+]
 
-def analyze_entry(entry: ParsedEntry) -> List[DetectionAlert]:
-    """Analyze a single parsed log entry and return any alerts triggered."""
+SENSITIVE_PATHS: List[Tuple[Pattern[str], str]] = [
+    (re.compile(r"/\.(?:env|git|svn|aws|ssh|htpasswd|DS_Store)(?:/|$|\.)", _I), "fisier ascuns/credentiale"),
+    (re.compile(r"wp-config\.php|/id_rsa\b|/server-status\b|/actuator(?:/|$)", _I), "configurare/endpoint intern"),
+    (re.compile(r"/(?:phpmyadmin|pma|adminer)(?:/|\.php|$)", _I), "panou de administrare baza de date"),
+    (re.compile(r"\.(?:bak|old|orig|swp|sql|dump|zip|tar\.gz)(?:$|\?)", _I), "backup/dump expus"),
+]
+
+_ADMIN_USERS = frozenset({"root", "admin", "administrator"})
+
+
+def _first_match(
+    rules: List[Tuple[Pattern[str], str]], text: str
+) -> Optional[Tuple[str, str]]:
+    """Returneaza (descriere_regula, text_potrivit) pentru prima regula care se potriveste."""
+    for pattern, description in rules:
+        found = pattern.search(text)
+        if found:
+            return description, found.group(0)
+    return None
+
+
+def _decode_payload(raw_request: str) -> str:
+    """Decodeaza URL de doua ori (prinde %252e%252e) si transforma '+' in spatiu."""
+    return unquote(unquote(raw_request.replace("+", " ")))
+
+
+def _analyze_auth(entry: AuthEntry) -> List[DetectionAlert]:
+    """Reguli pentru evenimente de autentificare SSH."""
+    if entry.event_type not in ("invalid_user", "failed_password"):
+        return []
+
+    user = entry.username or "?"
+    if entry.event_type == "invalid_user":
+        description = f"Autentificare SSH cu utilizator inexistent '{user}'"
+        severity = Severity.MEDIUM
+    else:
+        description = f"Parola gresita pentru contul existent '{user}'"
+        severity = Severity.HIGH if user in _ADMIN_USERS else Severity.MEDIUM
+
+    return [
+        DetectionAlert(
+            attack_type=AttackType.SSH_BRUTE_FORCE,
+            severity=severity,
+            description=description,
+            matched_detail=f"user={user} ip={entry.source_ip}",
+            entry=entry,
+        )
+    ]
+
+
+def _analyze_web(entry: WebEntry) -> List[DetectionAlert]:
+    """Reguli pentru cereri HTTP (payload in URL/query, User-Agent, Referer)."""
     alerts: List[DetectionAlert] = []
+    payload = _decode_payload(entry.raw_request)
+    ok_status = 200 <= entry.status_code < 300
 
-    if isinstance(entry, AuthEntry):
-        # 1. Invalid user attempts (User Enumeration)
-        if entry.event_type == "invalid_user":
-            alerts.append(
-                DetectionAlert(
-                    attack_type=AttackType.SSH_INVALID_USER,
-                    severity=Severity.MEDIUM,
-                    mitre_id="T1078 / T1110.001",
-                    mitre_tactic="Initial Access / Credential Access",
-                    description=f"Incercare de autentificare SSH cu cont inexistent ('{entry.username}').",
-                    matched_detail=f"User: {entry.username}, IP: {entry.source_ip}",
-                    entry=entry,
-                )
-            )
-        # 2. Failed password attempts on existing/known users
-        elif entry.event_type == "failed_password":
-            severity = Severity.HIGH if entry.username in ("root", "admin", "administrator") else Severity.MEDIUM
-            alerts.append(
-                DetectionAlert(
-                    attack_type=AttackType.SSH_FAILED_LOGIN,
-                    severity=severity,
-                    mitre_id="T1110.001",
-                    mitre_tactic="Credential Access",
-                    description=f"Autentificare esuata pe contul '{entry.username}'. Risc de ghicire parola (Brute Force).",
-                    matched_detail=f"User: {entry.username}, Method: {entry.auth_method}",
-                    entry=entry,
-                )
-            )
+    def add(kind: AttackType, severity: Severity, description: str, detail: str) -> None:
+        alerts.append(DetectionAlert(kind, severity, description, detail, entry))
 
-    elif isinstance(entry, WebEntry):
-        full_target = unquote(f"{entry.url_path}?{entry.query_string}" if entry.query_string else entry.url_path)
+    hit = _first_match(SQLI_RULES, payload)
+    if hit:
+        add(AttackType.SQL_INJECTION, Severity.HIGH, f"Tipar SQL injection: {hit[0]}", hit[1])
 
-        # 1. SQL Injection signatures
-        for pattern, desc in SQLI_PATTERNS:
-            match = pattern.search(full_target)
-            if match:
-                alerts.append(
-                    DetectionAlert(
-                        attack_type=AttackType.SQL_INJECTION,
-                        severity=Severity.HIGH,
-                        mitre_id="T1190",
-                        mitre_tactic="Initial Access / Exploitation",
-                        description=f"Tipar de SQL Injection detectat in cerere: {desc}.",
-                        matched_detail=match.group(0),
-                        entry=entry,
-                    )
-                )
-                break
+    hit = _first_match(TRAVERSAL_RULES, payload)
+    if hit:
+        severity = Severity.CRITICAL if ok_status else Severity.HIGH
+        suffix = " (raspuns 2xx: posibila divulgare de fisier!)" if ok_status else ""
+        add(AttackType.PATH_TRAVERSAL, severity, f"Path traversal: {hit[0]}{suffix}", hit[1])
 
-        # 2. Path Traversal signatures
-        for pattern, desc in PATH_TRAVERSAL_PATTERNS:
-            match = pattern.search(full_target)
-            if match:
-                alerts.append(
-                    DetectionAlert(
-                        attack_type=AttackType.PATH_TRAVERSAL,
-                        severity=Severity.HIGH,
-                        mitre_id="T1083 / T1005",
-                        mitre_tactic="Discovery / Collection",
-                        description=f"Incercare de traversare de directoare (Path Traversal): {desc}.",
-                        matched_detail=match.group(0),
-                        entry=entry,
-                    )
-                )
-                break
+    # Log4Shell/Shellshock se ascund frecvent in headere, nu doar in URL.
+    header_blob = f"{entry.user_agent or ''} {entry.referrer or ''}"
+    hit = _first_match(RCE_RULES, payload) or _first_match(RCE_RULES, header_blob)
+    if hit:
+        severity = Severity.CRITICAL if ok_status else Severity.HIGH
+        add(AttackType.RCE_ATTEMPT, severity, f"Injectie de comenzi/cod: {hit[0]}", hit[1])
 
-        # 3. Known scanner user agents
-        if entry.user_agent:
-            for pattern, desc in SCANNER_USER_AGENTS:
-                match = pattern.search(entry.user_agent)
-                if match:
-                    alerts.append(
-                        DetectionAlert(
-                            attack_type=AttackType.RECON_SCANNER,
-                            severity=Severity.MEDIUM,
-                            mitre_id="T1595.002",
-                            mitre_tactic="Reconnaissance",
-                            description=f"User-Agent asociat unui scanner automatizat: {desc}.",
-                            matched_detail=match.group(0),
-                            entry=entry,
-                        )
-                    )
-                    break
+    hit = _first_match(XSS_RULES, payload)
+    if hit:
+        add(AttackType.XSS, Severity.MEDIUM, f"Tipar XSS: {hit[0]}", hit[1])
 
-        # 4. Probing for sensitive endpoints
-        for pattern, desc in SENSITIVE_ENDPOINTS:
-            match = pattern.search(entry.url_path)
-            if match:
-                alerts.append(
-                    DetectionAlert(
-                        attack_type=AttackType.SENSITIVE_PROBE,
-                        severity=Severity.MEDIUM,
-                        mitre_id="T1596",
-                        mitre_tactic="Reconnaissance",
-                        description=f"Cautare activa de fisiere critice expuse: {desc}.",
-                        matched_detail=match.group(0),
-                        entry=entry,
-                    )
-                )
-                break
+    if entry.user_agent:
+        hit = _first_match(SCANNER_USER_AGENTS, entry.user_agent)
+        if hit:
+            add(AttackType.RECON_SCANNER, Severity.MEDIUM, f"User-Agent de scanner: {hit[0]}", hit[1])
+
+    hit = _first_match(SENSITIVE_PATHS, entry.url_path)
+    if hit:
+        add(AttackType.SENSITIVE_PROBE, Severity.MEDIUM, f"Cautare resursa sensibila: {hit[0]}", hit[1])
 
     return alerts
 
 
-def scan_entries(entries: List[ParsedEntry]) -> List[DetectionAlert]:
-    """Scan an entire collection of parsed entries and aggregate all triggered alerts."""
-    all_alerts: List[DetectionAlert] = []
+def analyze_entry(entry: ParsedEntry) -> List[DetectionAlert]:
+    """Analizeaza o singura intrare de log si returneaza alertele declansate."""
+    if isinstance(entry, AuthEntry):
+        return _analyze_auth(entry)
+    if isinstance(entry, WebEntry):
+        return _analyze_web(entry)
+    return []
+
+
+def _attempt_key(entry: AuthEntry) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    """Cheie de deduplicare: sshd scrie 'Invalid user' SI 'Failed password' pentru aceeasi incercare."""
+    return entry.pid, entry.source_ip, entry.username
+
+
+def _correlate_compromise(entries: List[ParsedEntry], threshold: int) -> List[DetectionAlert]:
+    """Detecteaza login reusit venit dupa >= `threshold` esecuri de la aceeasi adresa IP."""
+    failed: Dict[str, Set[Tuple[Optional[int], Optional[str], Optional[str]]]] = {}
+    alerts: List[DetectionAlert] = []
+
     for entry in entries:
-        alerts = analyze_entry(entry)
-        all_alerts.extend(alerts)
-    return all_alerts
+        if not isinstance(entry, AuthEntry) or not entry.source_ip:
+            continue
+        if entry.event_type in ("invalid_user", "failed_password"):
+            failed.setdefault(entry.source_ip, set()).add(_attempt_key(entry))
+        elif entry.event_type == "accepted":
+            count = len(failed.get(entry.source_ip, ()))
+            if count >= threshold:
+                alerts.append(
+                    DetectionAlert(
+                        attack_type=AttackType.SSH_COMPROMISE,
+                        severity=Severity.CRITICAL,
+                        description=(
+                            f"Login reusit pentru '{entry.username}' dupa {count} esecuri "
+                            f"de la aceeasi sursa"
+                        ),
+                        matched_detail=f"user={entry.username} ip={entry.source_ip} metoda={entry.auth_method}",
+                        entry=entry,
+                    )
+                )
+    return alerts
+
+
+def scan_entries(
+    entries: List[ParsedEntry], bruteforce_threshold: int = DEFAULT_BRUTEFORCE_THRESHOLD
+) -> List[DetectionAlert]:
+    """Ruleaza toate regulile pe o lista de intrari, plus corelarea intre evenimente."""
+    alerts: List[DetectionAlert] = []
+    for entry in entries:
+        alerts.extend(analyze_entry(entry))
+    alerts.extend(_correlate_compromise(entries, bruteforce_threshold))
+    return alerts

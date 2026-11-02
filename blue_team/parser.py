@@ -1,4 +1,4 @@
-"""Log parsing engine supporting Linux auth.log and Web access logs (Nginx/Apache)."""
+"""Motor de parsare pentru log-uri Linux auth (syslog) si web (Nginx/Apache combined)."""
 
 from __future__ import annotations
 
@@ -7,11 +7,12 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import List, Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote
 
 
 class LogType(str, Enum):
-    """Supported log categories."""
+    """Tipuri de log suportate."""
+
     AUTH = "auth"
     WEB = "web"
     UNKNOWN = "unknown"
@@ -19,7 +20,8 @@ class LogType(str, Enum):
 
 @dataclass
 class ParsedEntry:
-    """Base dataclass representing a parsed log line."""
+    """Reprezentarea de baza a unei linii de log parsate."""
+
     line_number: int
     raw_line: str
     timestamp: Optional[str]
@@ -29,231 +31,201 @@ class ParsedEntry:
 
 @dataclass
 class AuthEntry(ParsedEntry):
-    """Parsed representation of a Linux authentication log entry."""
-    service: str
-    event_type: str  # failed_password, invalid_user, accepted, closed, pam_session, other
+    """Eveniment de autentificare Linux (sshd, cron, sudo etc.)."""
+
+    service: str = "unknown"
+    # failed_password | invalid_user | accepted | closed | other
+    event_type: str = "other"
     username: Optional[str] = None
     port: Optional[int] = None
-    auth_method: Optional[str] = None  # password, publickey
+    pid: Optional[int] = None
+    auth_method: Optional[str] = None
     raw_message: str = ""
 
 
 @dataclass
 class WebEntry(ParsedEntry):
-    """Parsed representation of an Nginx/Apache Combined/Common log entry."""
+    """Cerere HTTP dintr-un access log Nginx/Apache (format combined/common)."""
+
     method: str = "GET"
     url_path: str = "/"
     query_string: str = ""
-    status_code: int = 200
+    raw_request: str = "/"
+    status_code: int = 0
     response_size: int = 0
     referrer: Optional[str] = None
     user_agent: Optional[str] = None
 
 
-# --- Regex Definitions ---
+_IP = r"[0-9a-fA-F:.]+"
 
-# Standard Syslog header: (Timestamp) (Host) (Process)[PID]: (Message)
-# Supports both RFC 3164 (Oct 22 18:14:02) and RFC 5424 / ISO 8601 (2026-10-22T18:14:02.123+03:00)
+# Antet syslog: RFC 3164 ("Oct 22 18:14:02") sau ISO 8601 ("2026-10-22T18:14:02+03:00")
 SYSLOG_REGEX = re.compile(
-    r"^(?:(?P<ts_bsd>[A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2})|(?P<ts_iso>\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?))\s+"
+    r"^(?:(?P<ts_bsd>[A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2})"
+    r"|(?P<ts_iso>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?))\s+"
     r"(?P<host>\S+)\s+"
-    r"(?P<service>[\w\-]+)(?:\[(?P<pid>\d+)\])?:\s+"
+    r"(?P<service>[\w.\-/]+?)(?:\[(?P<pid>\d+)\])?:\s+"
     r"(?P<message>.*)$"
 )
 
-# Inner SSH auth messages
 SSH_FAILED_INVALID = re.compile(
-    r"Failed\s+(?P<method>password|publickey)\s+for\s+invalid\s+user\s+(?P<user>\S+)\s+from\s+(?P<ip>[\d\.:a-fA-F]+)\s+port\s+(?P<port>\d+)"
+    rf"Failed\s+(?P<method>\S+)\s+for\s+invalid\s+user\s+(?P<user>.+?)\s+from\s+(?P<ip>{_IP})\s+port\s+(?P<port>\d+)"
 )
 SSH_FAILED_USER = re.compile(
-    r"Failed\s+(?P<method>password|publickey)\s+for\s+(?P<user>\S+)\s+from\s+(?P<ip>[\d\.:a-fA-F]+)\s+port\s+(?P<port>\d+)"
+    rf"Failed\s+(?P<method>\S+)\s+for\s+(?P<user>\S+)\s+from\s+(?P<ip>{_IP})\s+port\s+(?P<port>\d+)"
 )
 SSH_INVALID_USER = re.compile(
-    r"Invalid\s+user\s+(?P<user>\S+)\s+from\s+(?P<ip>[\d\.:a-fA-F]+)(?:\s+port\s+(?P<port>\d+))?"
+    rf"Invalid\s+user\s+(?P<user>.*?)\s+from\s+(?P<ip>{_IP})(?:\s+port\s+(?P<port>\d+))?"
 )
 SSH_ACCEPTED = re.compile(
-    r"Accepted\s+(?P<method>password|publickey)\s+for\s+(?P<user>\S+)\s+from\s+(?P<ip>[\d\.:a-fA-F]+)\s+port\s+(?P<port>\d+)"
+    rf"Accepted\s+(?P<method>\S+)\s+for\s+(?P<user>\S+)\s+from\s+(?P<ip>{_IP})\s+port\s+(?P<port>\d+)"
 )
 SSH_CLOSED = re.compile(
-    r"Connection\s+closed\s+by\s+(?:authenticating\s+user\s+)?(?P<user>\S+)?\s*(?P<ip>[\d\.:a-fA-F]+)\s+port\s+(?P<port>\d+)"
+    rf"(?:Connection\s+closed\s+by|Disconnected\s+from)\s+(?:(?:authenticating|invalid)\s+user\s+(?P<user>\S+)\s+)?"
+    rf"(?P<ip>{_IP})\s+port\s+(?P<port>\d+)"
 )
 
-# Nginx/Apache Combined Log format
-# IP - User [Timestamp] "METHOD /path HTTP/x.x" STATUS SIZE "Referrer" "User-Agent"
-WEB_COMBINED_REGEX = re.compile(
-    r'^(?P<ip>[\d\.:a-fA-F]+)\s+(?P<ident>\S+)\s+(?P<authuser>\S+)\s+\[(?P<timestamp>[^\]]+)\]\s+'
-    r'"(?P<method>[A-Z]+)\s+(?P<request>[^\s"]+)(?:\s+HTTP/[\d\.]+)?\"\s+'
+# IP - user [timestamp] "METHOD request [HTTP/x]" status size ["referrer" "user-agent"]
+WEB_REGEX = re.compile(
+    rf'^(?P<ip>{_IP})\s+\S+\s+\S+\s+\[(?P<timestamp>[^\]]+)\]\s+'
+    r'"(?P<method>[A-Za-z]+)\s+(?P<request>.*?)(?:\s+HTTP/[\d.]+)?"\s+'
     r'(?P<status>\d{3})\s+(?P<size>\S+)'
     r'(?:\s+"(?P<referrer>[^"]*)"\s+"(?P<user_agent>[^"]*)")?'
 )
 
 
-def parse_auth_line(line: str, line_number: int) -> Optional[AuthEntry]:
-    """Parse a single auth.log syslog line into an AuthEntry object."""
+def _to_int(value: Optional[str]) -> Optional[int]:
+    """Converteste in int un grup optional de regex."""
+    return int(value) if value else None
+
+
+def parse_auth_line(line: str, line_number: int = 1) -> Optional[AuthEntry]:
+    """Parseaza o linie syslog/auth.log. Returneaza None daca nu respecta formatul."""
     match = SYSLOG_REGEX.match(line.strip())
     if not match:
         return None
 
-    groups = match.groupdict()
-    timestamp = groups.get("ts_bsd") or groups.get("ts_iso")
-    service = groups.get("service") or "unknown"
-    message = groups.get("message") or ""
-
+    g = match.groupdict()
+    message = g["message"] or ""
     event_type = "other"
-    username = None
-    ip = None
-    port = None
-    auth_method = None
+    username: Optional[str] = None
+    ip: Optional[str] = None
+    port: Optional[int] = None
+    method: Optional[str] = None
 
-    # Check SSH specific patterns
-    m_failed_inv = SSH_FAILED_INVALID.search(message)
-    if m_failed_inv:
-        event_type = "invalid_user"
-        auth_method = m_failed_inv.group("method")
-        username = m_failed_inv.group("user")
-        ip = m_failed_inv.group("ip")
-        port = int(m_failed_inv.group("port"))
-    else:
-        m_failed = SSH_FAILED_USER.search(message)
-        if m_failed:
-            event_type = "failed_password"
-            auth_method = m_failed.group("method")
-            username = m_failed.group("user")
-            ip = m_failed.group("ip")
-            port = int(m_failed.group("port"))
-        else:
-            m_inv = SSH_INVALID_USER.search(message)
-            if m_inv:
-                event_type = "invalid_user"
-                username = m_inv.group("user")
-                ip = m_inv.group("ip")
-                if m_inv.group("port"):
-                    port = int(m_inv.group("port"))
-            else:
-                m_acc = SSH_ACCEPTED.search(message)
-                if m_acc:
-                    event_type = "accepted"
-                    auth_method = m_acc.group("method")
-                    username = m_acc.group("user")
-                    ip = m_acc.group("ip")
-                    port = int(m_acc.group("port"))
-                else:
-                    m_close = SSH_CLOSED.search(message)
-                    if m_close:
-                        event_type = "closed"
-                        username = m_close.group("user")
-                        ip = m_close.group("ip")
-                        port = int(m_close.group("port"))
-                    elif "pam_unix" in message:
-                        event_type = "pam_session"
+    # Ordinea conteaza: "Failed ... invalid user" trebuie testat inaintea lui "Failed ... user".
+    for event, regex in (
+        ("invalid_user", SSH_FAILED_INVALID),
+        ("failed_password", SSH_FAILED_USER),
+        ("invalid_user", SSH_INVALID_USER),
+        ("accepted", SSH_ACCEPTED),
+        ("closed", SSH_CLOSED),
+    ):
+        m = regex.search(message)
+        if m:
+            event_type = event
+            groups = m.groupdict()
+            username = groups.get("user")
+            ip = groups.get("ip")
+            port = _to_int(groups.get("port"))
+            method = groups.get("method")
+            break
 
     return AuthEntry(
         line_number=line_number,
         raw_line=line.rstrip("\r\n"),
-        timestamp=timestamp,
+        timestamp=g.get("ts_bsd") or g.get("ts_iso"),
         source_ip=ip,
         log_type=LogType.AUTH,
-        service=service,
+        service=g.get("service") or "unknown",
         event_type=event_type,
         username=username,
         port=port,
-        auth_method=auth_method,
+        pid=_to_int(g.get("pid")),
+        auth_method=method,
         raw_message=message,
     )
 
 
-def parse_web_line(line: str, line_number: int) -> Optional[WebEntry]:
-    """Parse a single web server access log line into a WebEntry object."""
-    match = WEB_COMBINED_REGEX.match(line.strip())
+def parse_web_line(line: str, line_number: int = 1) -> Optional[WebEntry]:
+    """Parseaza o linie de access log web. Returneaza None daca nu respecta formatul."""
+    match = WEB_REGEX.match(line.strip())
     if not match:
         return None
 
-    groups = match.groupdict()
-    ip = groups.get("ip")
-    timestamp = groups.get("timestamp")
-    method = groups.get("method") or "GET"
-    raw_request = groups.get("request") or "/"
-    status = int(groups.get("status") or 0)
-    size_str = groups.get("size") or "0"
-    size = int(size_str) if size_str.isdigit() else 0
-    referrer = groups.get("referrer")
-    user_agent = groups.get("user_agent")
-
-    # Split request into path and query string (decoding URL entities)
-    decoded_request = unquote(raw_request)
-    parsed_url = urlparse(decoded_request)
-    path = parsed_url.path or "/"
-    query = parsed_url.query or ""
+    g = match.groupdict()
+    raw_request = g["request"] or "/"
+    # Separam pe cererea BRUTA: '#' sau '?' din payload nu trebuie sa piarda partea de query.
+    path, _, query = raw_request.partition("?")
+    size = g["size"]
 
     return WebEntry(
         line_number=line_number,
         raw_line=line.rstrip("\r\n"),
-        timestamp=timestamp,
-        source_ip=ip,
+        timestamp=g["timestamp"],
+        source_ip=g["ip"],
         log_type=LogType.WEB,
-        method=method,
-        url_path=path,
-        query_string=query,
-        status_code=status,
-        response_size=size,
-        referrer=referrer,
-        user_agent=user_agent,
+        method=g["method"].upper(),
+        url_path=unquote(path) or "/",
+        query_string=unquote(query),
+        raw_request=raw_request,
+        status_code=int(g["status"]),
+        response_size=int(size) if size.isdigit() else 0,
+        referrer=g.get("referrer"),
+        user_agent=g.get("user_agent"),
     )
 
 
-def detect_log_type(file_path: Path | str) -> LogType:
-    """Inspect the first non-empty lines to determine log type."""
+def detect_log_type(file_path: Path | str, sample_lines: int = 50) -> LogType:
+    """Detecteaza tipul logului dupa majoritatea liniilor din primele `sample_lines` linii."""
     path = Path(file_path)
-    if not path.is_file():
-        raise FileNotFoundError(f"Log file not found: {path}")
-
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        for _ in range(20):
-            line = f.readline()
-            if not line:
+    auth_hits = web_hits = 0
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for index, line in enumerate(handle):
+            if index >= sample_lines:
                 break
-            line_str = line.strip()
-            if not line_str:
+            if not line.strip():
                 continue
+            # Web testat primul: o linie web nu se potriveste niciodata antetului syslog.
+            if parse_web_line(line):
+                web_hits += 1
+            elif parse_auth_line(line):
+                auth_hits += 1
 
-            if parse_auth_line(line_str, 1) is not None:
-                return LogType.AUTH
-            if parse_web_line(line_str, 1) is not None:
-                return LogType.WEB
-
-    return LogType.UNKNOWN
+    if not auth_hits and not web_hits:
+        return LogType.UNKNOWN
+    return LogType.WEB if web_hits >= auth_hits else LogType.AUTH
 
 
-def parse_log_file(file_path: Path | str, forced_type: Optional[LogType] = None) -> List[ParsedEntry]:
-    """Read and parse all valid lines from the given log file."""
+def parse_log_file(
+    file_path: Path | str, forced_type: Optional[LogType] = None
+) -> List[ParsedEntry]:
+    """Citeste un fisier de log si returneaza intrarile parsate.
+
+    Raises:
+        FileNotFoundError: fisierul nu exista.
+        IsADirectoryError: calea indica un director.
+        PermissionError: lipsesc drepturile de citire.
+    """
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"Fisierul de log nu exista: {path}")
+    if not path.is_file():
+        raise IsADirectoryError(f"Calea nu este un fisier: {path}")
 
     log_type = forced_type or detect_log_type(path)
     entries: List[ParsedEntry] = []
 
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        for idx, line in enumerate(f, start=1):
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for number, line in enumerate(handle, start=1):
             if not line.strip():
                 continue
-
+            entry: Optional[ParsedEntry] = None
             if log_type == LogType.AUTH:
-                entry = parse_auth_line(line, idx)
-                if entry:
-                    entries.append(entry)
+                entry = parse_auth_line(line, number)
             elif log_type == LogType.WEB:
-                entry = parse_web_line(line, idx)
-                if entry:
-                    entries.append(entry)
-            else:
-                # Try both as fallback
-                entry_a = parse_auth_line(line, idx)
-                if entry_a:
-                    entries.append(entry_a)
-                else:
-                    entry_w = parse_web_line(line, idx)
-                    if entry_w:
-                        entries.append(entry_w)
+                entry = parse_web_line(line, number)
+            if entry:
+                entries.append(entry)
 
     return entries

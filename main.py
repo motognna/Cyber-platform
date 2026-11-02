@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""
-AI Log Hunter & Tutor
----------------------
-An educational Blue & Red team platform for log analysis, heuristic threat detection,
-and AI-assisted incident triage via local Ollama LLMs.
+"""AI Log Hunter & Tutor - CLI.
+
+Analizeaza log-uri (auth.log / access.log), detecteaza atacuri, le coreleaza in incidente si
+cere unui model Ollama local sa le explice educational.
+
+Exemplu:  python main.py --log sample_logs/auth_bruteforce.log --model llama3.2
 """
 
 from __future__ import annotations
@@ -11,268 +12,239 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Sequence
 
-from rich.console import Console
+from rich.markup import escape
 
-from blue_team.aggregator import aggregate_alerts
-from blue_team.ai_tutor import DEFAULT_MODEL, OllamaClient
-from blue_team.detector import scan_entries
+from blue_team.aggregator import SecurityIncident, aggregate_alerts
+from blue_team.ai_tutor import DEFAULT_MODEL, OllamaClient, OllamaError, TutorResult
+from blue_team.detector import DEFAULT_BRUTEFORCE_THRESHOLD, scan_entries
 from blue_team.parser import LogType, parse_log_file
 from red_team.mock_logs import generate_synthetic_auth_log, generate_synthetic_web_log
-from red_team.traffic_simulator import simulate_ssh_auth_traffic, simulate_web_traffic
+from red_team.traffic_simulator import SimulationError, simulate_ssh_bruteforce, simulate_web_attacks
 from ui.terminal import (
     console,
     export_markdown_report,
-    print_ai_explanation,
+    live_explanation,
     print_banner,
     print_incidents_table,
     print_log_summary,
+    print_tutor_warning,
 )
 
-
-def handle_check_ollama(client: OllamaClient) -> None:
-    """Check Ollama connectivity and display installed models."""
-    console.print("[bold cyan]Verificare conectivitate Ollama (http://localhost:11434)...[/bold cyan]")
-    health = client.check_connection()
-    if health["online"]:
-        models = health["models"]
-        console.print("[bold green]✓ Serviciul Ollama ruleaza si este accesibil![/bold green]")
-        if models:
-            console.print("[cyan]Modele disponibile local:[/cyan]")
-            for m in models:
-                console.print(f"  • [bold white]{m}[/bold white]")
-        else:
-            console.print("[yellow]! Nu exista niciun model descărcat. Ruleaza: 'ollama pull llama3.2'[/yellow]")
-    else:
-        console.print(f"[bold red]✗ Conexiunea a esuat:[/bold red]\n{health['error']}")
-
-
-def handle_generate_mock(output_file: str, log_type_str: str) -> None:
-    """Generate mock log data for offline practice."""
-    path = Path(output_file)
-    if log_type_str == "web":
-        generate_synthetic_web_log(path)
-        console.print(f"[bold green]✓ Fisier mock Nginx generat cu succes la:[/bold green] [bold white]{path}[/bold white]")
-    else:
-        generate_synthetic_auth_log(path)
-        console.print(f"[bold green]✓ Fisier mock SSH auth generat cu succes la:[/bold green] [bold white]{path}[/bold white]")
-
-
-def handle_simulation(service: str, target: str, port: int) -> None:
-    """Run safe lab traffic simulator."""
-    console.print(f"[bold yellow]⚠️  Lansare simulator de trafic Red Team catre {target}:{port}...[/bold yellow]")
-    try:
-        if service == "ssh":
-            simulate_ssh_auth_traffic(target_host=target, target_port=port)
-        elif service == "web":
-            simulate_web_traffic(target_host=target, target_port=port)
-        else:
-            console.print(f"[red]Serviciu necunoscut: {service}. Alege 'ssh' sau 'web'.[/red]")
-    except ValueError as ve:
-        console.print(f"[bold red]Eroare de siguranta:[/bold red] {ve}")
-    except Exception as exc:
-        console.print(f"[bold red]Eroare simulare:[/bold red] {exc}")
-
-
-def handle_analysis(
-    log_file: str,
-    model_name: str,
-    log_type_opt: Optional[str] = None,
-    skip_ai: bool = False,
-    export_path: Optional[str] = None,
-) -> None:
-    """Execute the full Blue Team analysis pipeline."""
-    target_path = Path(log_file)
-    if not target_path.exists():
-        console.print(f"[bold red]Eroare:[/bold red] Fisierul de log nu exista: [bold white]{log_file}[/bold white]")
-        sys.exit(1)
-
-    forced_type = None
-    if log_type_opt:
-        forced_type = LogType.AUTH if log_type_opt.lower() == "auth" else LogType.WEB
-
-    try:
-        entries = parse_log_file(target_path, forced_type=forced_type)
-    except PermissionError:
-        console.print(
-            f"[bold red]Eroare de permisiuni:[/bold red] Nu ai drepturi de citire pentru [bold white]{log_file}[/bold white].\n"
-            "Foloseste 'sudo' sau copiaza log-ul intr-un director accesibil utilizatorului tau."
-        )
-        sys.exit(1)
-    except Exception as exc:
-        console.print(f"[bold red]Eroare la parsarea fisierului:[/bold red] {exc}")
-        sys.exit(1)
-
-    if not entries:
-        console.print(f"[yellow]Fisierul {log_file} este gol sau nu contine linii compatibile de log.[/yellow]")
-        return
-
-    detected_type = entries[0].log_type
-    print_log_summary(entries, detected_type, str(target_path))
-
-    # Run detection rules
-    alerts = scan_entries(entries)
-    incidents = aggregate_alerts(alerts)
-
-    print_incidents_table(incidents)
-
-    explanations: Dict[str, str] = {}
-
-    if incidents and not skip_ai:
-        client = OllamaClient()
-        health = client.check_connection()
-
-        if not health["online"]:
-            console.print(
-                f"[bold yellow]⚠️  Ollama nu este disponibil.[/bold yellow] Sarim peste analiza AI.\n"
-                f"[dim]{health['error']}[/dim]\n"
-            )
-        else:
-            resolved_model = client.resolve_model(model_name)
-            console.print(
-                f"[bold cyan]🤖 Initiere AI Tutor cu modelul:[/bold cyan] [bold green]{resolved_model}[/bold green]\n"
-            )
-
-            for inc in incidents:
-                with console.status(
-                    f"[bold cyan]Ollama ({resolved_model}) analizeaza incidentul {inc.incident_id}...[/bold cyan]",
-                    spinner="dots",
-                ):
-                    explanation = client.explain_incident(inc, model=resolved_model)
-
-                explanations[inc.incident_id] = explanation
-                print_ai_explanation(inc, explanation)
-
-    # Optional report export
-    if export_path:
-        out = export_markdown_report(incidents, explanations, export_path, str(target_path))
-        console.print(f"[bold green]✓ Raport Markdown salvat cu succes la:[/bold green] [bold white]{out}[/bold white]")
+EXIT_OK = 0
+EXIT_ERROR = 1
+DEFAULT_AI_INCIDENTS = 5
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the command-line argument parser."""
+    """Defineste argumentele liniei de comanda."""
     parser = argparse.ArgumentParser(
-        description="AI Log Hunter & Tutor - Educational Cybersecurity CLI & Local AI Mentor",
+        prog="main.py",
+        description="AI Log Hunter & Tutor - detectie de atacuri in log-uri + mentor AI local (Ollama).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Exemple de utilizare:
-  # 1. Analizeaza un fisier auth.log cu modelul default llama3.2:
-  python main.py --log sample_logs/auth_bruteforce.log
-
-  # 2. Analizeaza log-uri web specificand modelul:
-  python main.py --log sample_logs/nginx_sqli.log --model llama3.2
-
-  # 3. Analizeaza fara AI (doar euristica & tabel incidente):
-  python main.py --log sample_logs/auth_bruteforce.log --skip-ai
-
-  # 4. Salveaza raport complet Markdown:
-  python main.py --log sample_logs/auth_bruteforce.log --export raport_incident.md
-
-  # 5. Genereaza log-uri mock pentru teste:
-  python main.py --generate-mock test_ssh.log --type auth
-
-  # 6. Verifica starea conexiunii Ollama:
+        epilog="""exemple:
+  python main.py --log sample_logs/auth_bruteforce.log --model llama3.2
+  python main.py --log sample_logs/nginx_sqli.log --skip-ai
+  python main.py --log sample_logs/auth_compromise.log --export raport.md
+  python main.py --generate-mock demo.log --type auth --compromise
+  python main.py --simulate ssh --target 127.0.0.1 --port 2222
   python main.py --check-ollama
-        """,
+""",
     )
+    analysis = parser.add_argument_group("analiza (Blue Team)")
+    analysis.add_argument("--log", "-l", metavar="FISIER", help="fisierul de log de analizat")
+    analysis.add_argument(
+        "--model", "-m", default=None, metavar="MODEL",
+        help=f"modelul Ollama (implicit: {DEFAULT_MODEL}, sau $LOGHUNTER_MODEL)",
+    )
+    analysis.add_argument("--type", "-t", choices=["auth", "web"], help="forteaza tipul logului (implicit: autodetectie)")
+    analysis.add_argument("--skip-ai", action="store_true", help="doar detectie, fara explicatii AI")
+    analysis.add_argument(
+        "--ai-top", type=int, default=DEFAULT_AI_INCIDENTS, metavar="N",
+        help=f"explica prin AI doar primele N incidente dupa severitate (implicit: {DEFAULT_AI_INCIDENTS}, 0 = toate)",
+    )
+    analysis.add_argument(
+        "--threshold", type=int, default=DEFAULT_BRUTEFORCE_THRESHOLD, metavar="N",
+        help=f"nr. minim de autentificari esuate pentru brute force (implicit: {DEFAULT_BRUTEFORCE_THRESHOLD})",
+    )
+    analysis.add_argument("--export", "-e", metavar="RAPORT.md", help="salveaza raportul in format Markdown")
 
-    parser.add_argument(
-        "--log",
-        "-l",
-        type=str,
-        help="Calea catre fisierul de log ce urmeaza sa fie analizat (ex: /var/log/auth.log sau sample_logs/auth_bruteforce.log)",
+    lab = parser.add_argument_group("laborator (Red Team)")
+    lab.add_argument("--simulate", choices=["ssh", "web"], help="genereaza trafic de atac catre o tinta de laborator")
+    lab.add_argument("--target", default="127.0.0.1", help="IP-ul tintei (doar loopback/privat; implicit: 127.0.0.1)")
+    lab.add_argument("--port", "-p", type=int, help="portul tintei (implicit: 22 pentru ssh, 80 pentru web)")
+    lab.add_argument(
+        "--with-valid-login", action="store_true",
+        help="la --simulate ssh: adauga la final un login reusit (user victim) pentru a demonstra detectia compromiterii",
     )
-    parser.add_argument(
-        "--model",
-        "-m",
-        type=str,
-        default=DEFAULT_MODEL,
-        help=f"Numele modelului Ollama utilizat pentru explicatii (default: {DEFAULT_MODEL})",
-    )
-    parser.add_argument(
-        "--type",
-        "-t",
-        choices=["auth", "web"],
-        help="Forteaza tipul de log (auth sau web). Daca este omis, tipul este detectat automat.",
-    )
-    parser.add_argument(
-        "--skip-ai",
-        action="store_true",
-        help="Ruleaza doar parsarea si tabelul de incidente, fara interogarea modelului Ollama.",
-    )
-    parser.add_argument(
-        "--export",
-        "-e",
-        type=str,
-        help="Salveaza rezultatele si analiza AI intr-un raport Markdown la calea specificata.",
-    )
-    parser.add_argument(
-        "--check-ollama",
-        action="store_true",
-        help="Verifica daca serviciul Ollama este activ si afiseaza lista de modele descarcate.",
-    )
-    parser.add_argument(
-        "--generate-mock",
-        type=str,
-        metavar="OUTPUT_FILE",
-        help="Genereaza un fisier de log sintetic pentru testare rapida (foloseste --type pentru auth sau web).",
-    )
-    parser.add_argument(
-        "--simulate",
-        choices=["ssh", "web"],
-        help="Lanseaza simulatorul de trafic de laborator impotriva unei tinte locale (ex: --simulate ssh).",
-    )
-    parser.add_argument(
-        "--target",
-        type=str,
-        default="127.0.0.1",
-        help="Adresa IP a tintei locale pentru simulare (default: 127.0.0.1).",
-    )
-    parser.add_argument(
-        "--port",
-        "-p",
-        type=int,
-        help="Portul tintei pentru simulare (default: 22 pentru ssh, 80 pentru web).",
-    )
+    lab.add_argument("--generate-mock", metavar="FISIER", help="genereaza un log sintetic (cu --type auth|web)")
+    lab.add_argument("--compromise", action="store_true", help="la --generate-mock auth: include un login reusit al atacatorului")
 
+    parser.add_argument("--check-ollama", action="store_true", help="verifica Ollama si listeaza modelele instalate")
     return parser
 
 
-def main() -> None:
-    """CLI application entrypoint."""
+def _count_nonempty_lines(path: Path) -> int:
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        return sum(1 for line in handle if line.strip())
+
+
+def cmd_check_ollama(client: OllamaClient) -> int:
+    """Verifica conectivitatea cu Ollama."""
+    health = client.check_connection()
+    if not health["online"]:
+        console.print(f"[bold red]Ollama indisponibil:[/bold red] {escape(str(health['error']))}")
+        return EXIT_ERROR
+    console.print(f"[bold green]Ollama ruleaza[/bold green] ({escape(client.base_url)})")
+    if health["models"]:
+        console.print("Modele instalate:")
+        for name in health["models"]:
+            console.print(f"  - {escape(name)}")
+    else:
+        console.print("[yellow]Niciun model instalat. Ruleaza: ollama pull llama3.2[/yellow]")
+    return EXIT_OK
+
+
+def cmd_generate_mock(path: str, log_type: str, compromise: bool) -> int:
+    """Genereaza un log sintetic."""
+    try:
+        if log_type == "web":
+            out = generate_synthetic_web_log(path)
+        else:
+            out = generate_synthetic_auth_log(path, include_compromise=compromise)
+    except OSError as exc:
+        console.print(f"[bold red]Nu pot scrie fisierul:[/bold red] {escape(str(exc))}")
+        return EXIT_ERROR
+    console.print(f"[bold green]Log {log_type} generat:[/bold green] {escape(str(out))}")
+    return EXIT_OK
+
+
+def cmd_simulate(service: str, target: str, port: Optional[int], with_valid_login: bool) -> int:
+    """Ruleaza simulatorul Red Team."""
+    port = port or (22 if service == "ssh" else 80)
+    console.print(f"[bold yellow]Red Team: simulare {service.upper()} -> {target}:{port}[/bold yellow]")
+    try:
+        if service == "ssh":
+            creds = ("victim", "password123") if with_valid_login else None
+            result = simulate_ssh_bruteforce(target, port, valid_credentials=creds, progress=lambda m: console.print(escape(m)))
+        else:
+            result = simulate_web_attacks(target, port, progress=lambda m: console.print(escape(m)))
+    except SimulationError as exc:
+        console.print(f"[bold red]Simulare esuata:[/bold red] {escape(str(exc))}")
+        return EXIT_ERROR
+    console.print(
+        f"[bold green]Gata:[/bold green] {result.attempts} actiuni trimise catre {escape(result.target)}"
+        + (f", {result.successes} reusite" if result.service == "ssh" else "")
+        + ".\nUrmatorul pas: extrage log-ul din laborator (./lab_setup/setup_lab.sh logs) si analizeaza-l cu --log."
+    )
+    return EXIT_OK
+
+
+def _run_ai(
+    incidents: List[SecurityIncident], client: OllamaClient, requested_model: Optional[str], top: int
+) -> Dict[str, TutorResult]:
+    """Genereaza explicatii AI pentru primele `top` incidente. Nu opreste analiza la erori."""
+    results: Dict[str, TutorResult] = {}
+    try:
+        model = client.resolve_model(requested_model)
+    except OllamaError as exc:
+        console.print(f"[bold yellow]Explicatiile AI sunt omise:[/bold yellow] {escape(str(exc))}\n")
+        return results
+
+    selected = incidents if top <= 0 else incidents[:top]
+    if len(selected) < len(incidents):
+        console.print(f"[dim]AI: explic primele {len(selected)} din {len(incidents)} incidente (--ai-top).[/dim]")
+    console.print(f"[bold cyan]AI Tutor:[/bold cyan] model [bold green]{escape(model)}[/bold green]\n")
+
+    for incident in selected:
+        try:
+            with live_explanation(incident, model) as push:
+                result = client.explain_incident(incident, model=model, on_token=push)
+        except OllamaError as exc:
+            console.print(f"[bold red]AI esuat pentru {incident.incident_id}:[/bold red] {escape(str(exc))}\n")
+            if "conecta" in str(exc) or "intrerupt" in str(exc):
+                break  # serviciul a cazut: nu mai insista pe restul incidentelor
+            continue
+        results[incident.incident_id] = result
+        print_tutor_warning(result)
+    return results
+
+
+def cmd_analyze(args: argparse.Namespace) -> int:
+    """Pipeline complet: parsare -> detectie -> agregare -> explicatii AI -> raport."""
+    path = Path(args.log)
+    forced = LogType(args.type) if args.type else None
+
+    try:
+        entries = parse_log_file(path, forced_type=forced)
+        total = _count_nonempty_lines(path)
+    except FileNotFoundError:
+        console.print(f"[bold red]Fisierul nu exista:[/bold red] {escape(str(path))}")
+        return EXIT_ERROR
+    except IsADirectoryError:
+        console.print(f"[bold red]Este un director, nu un fisier:[/bold red] {escape(str(path))}")
+        return EXIT_ERROR
+    except PermissionError:
+        console.print(
+            f"[bold red]Permisiune refuzata la citirea[/bold red] {escape(str(path))}.\n"
+            f"Copiaza logul intr-un loc accesibil (ex. 'sudo cp {path} ./log.copy && sudo chown $USER ./log.copy') "
+            "sau ruleaza cu un utilizator care il poate citi."
+        )
+        return EXIT_ERROR
+
+    if not entries:
+        console.print(
+            f"[bold red]Nicio linie recunoscuta[/bold red] in {escape(str(path))}. Formatele suportate: syslog/auth.log si "
+            "access.log Nginx/Apache (combined). Incearca --type auth sau --type web."
+        )
+        return EXIT_ERROR
+
+    print_log_summary(entries, entries[0].log_type, str(path), total)
+
+    alerts = scan_entries(entries, bruteforce_threshold=args.threshold)
+    incidents = aggregate_alerts(alerts, bruteforce_threshold=args.threshold)
+    print_incidents_table(incidents)
+
+    explanations: Dict[str, TutorResult] = {}
+    if incidents and not args.skip_ai:
+        explanations = _run_ai(incidents, OllamaClient(), args.model, args.ai_top)
+
+    if args.export:
+        try:
+            out = export_markdown_report(incidents, explanations, args.export, str(path))
+        except OSError as exc:
+            console.print(f"[bold red]Nu pot scrie raportul:[/bold red] {escape(str(exc))}")
+            return EXIT_ERROR
+        console.print(f"[bold green]Raport salvat:[/bold green] {escape(str(out))}")
+    return EXIT_OK
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Punct de intrare. Returneaza codul de iesire al procesului."""
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    if args.threshold < 1:
+        parser.error("--threshold trebuie sa fie >= 1")
 
     print_banner()
+    try:
+        if args.check_ollama:
+            return cmd_check_ollama(OllamaClient())
+        if args.generate_mock:
+            return cmd_generate_mock(args.generate_mock, args.type or "auth", args.compromise)
+        if args.simulate:
+            return cmd_simulate(args.simulate, args.target, args.port, args.with_valid_login)
+        if args.log:
+            return cmd_analyze(args)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Intrerupt de utilizator.[/yellow]")
+        return 130
 
-    if args.check_ollama:
-        handle_check_ollama(OllamaClient())
-        return
-
-    if args.generate_mock:
-        handle_generate_mock(args.generate_mock, args.type or "auth")
-        return
-
-    if args.simulate:
-        default_port = 22 if args.simulate == "ssh" else 80
-        port = args.port or default_port
-        handle_simulation(args.simulate, args.target, port)
-        return
-
-    if args.log:
-        handle_analysis(
-            log_file=args.log,
-            model_name=args.model,
-            log_type_opt=args.type,
-            skip_ai=args.skip_ai,
-            export_path=args.export,
-        )
-        return
-
-    # If no primary action passed, display help
     parser.print_help()
+    return EXIT_OK
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

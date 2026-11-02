@@ -10,6 +10,12 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
+## Artefacte generate de aplicatie (log-uri extrase din laborator, rapoarte)
+vm_auth.log
+vm_access.log
+raport*.md
+report*.md
+
 # User-specific files
 *.rsuser
 *.suo
